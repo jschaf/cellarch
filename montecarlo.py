@@ -420,6 +420,3 @@ print(f'Number of outages with data completely unavailable: {len(full_outages)}'
 print()
 print(OutageClique.table_header())
 print('\n'.join(o.format() for o in full_outages))
-
-# %%
-np.rint(np.sort(np.random.exponential(6, 10)))
