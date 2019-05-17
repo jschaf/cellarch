@@ -11,9 +11,10 @@ TODO: model mean time to failure as a distribution
 𝑡 - the recovery time for a machine after it fails.
 """
 # %% Imports
+import dataclasses
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, List, FrozenSet, Tuple, NewType, Callable
+from typing import Dict, List, FrozenSet, NewType, Callable
 
 import pandas as pd
 import numpy as np
@@ -51,6 +52,10 @@ RandomDist1dFn = NewType('RandomDist', Callable[[int], np.ndarray])
 
 def hours(n: int) -> datetime.timedelta:
     return datetime.timedelta(hours=n)
+
+
+def days(n: int):
+    return datetime.timedelta(days=n)
 
 
 def total_hours(delta: datetime.timedelta) -> int:
@@ -118,8 +123,9 @@ time_to_failure_exp_dist(5, mttf=hours(10), sim_duration=hours(50))
 
 @dataclass(frozen=True, order=True)
 class Outage:
-    """An outage is any period of time where a machine is down."""
-    # Order is important, we want to sort by hours first.
+    """An outage is the period of time where a machine is down."""
+    # Order is important, we want to sort by hours first to ease finding
+    # overlaps in outages.
     start_hour: int
     end_hour: int
     machine: int
@@ -129,25 +135,24 @@ def gen_machine_outages(
         failure_starts: np.ndarray,
         time_to_repair_dist: RandomDist1dFn) -> List[Outage]:
     """Generates a list of outages from failure starts using a distribution to
-    model the time to repair..
+    model the time to repair.
     """
-    num_rows = failure_starts.shape[0]
-    num_cols = failure_starts.shape[1]
-    machine_idxs = np.repeat(np.arange(num_rows), num_cols).reshape(failure_starts.shape)
-
     repair_times = time_to_repair_dist(failure_starts.size).reshape(failure_starts.shape)
     failure_ends = failure_starts + repair_times
-    start_end_idxs = np.dstack((machine_idxs, failure_starts, failure_ends))
-    # Flatten all but the last dimension to get [[start, end, machine], ...]
-    # https://stackoverflow.com/a/26553855/30900
-    reshaped = start_end_idxs.reshape(-1, start_end_idxs.shape[-1])
+    start_ends = np.dstack((failure_starts, failure_ends))
+    outages = []
+    for row, failures in enumerate(start_ends):
+        prev_end = float('-inf')
+        for i, (start, end) in enumerate(failures):
+            # If overlap, coalesce the outages into a single one.
+            if start <= prev_end:
+                prev_outage = outages[-1]
+                outages[-1] = dataclasses.replace(prev_outage, end_hour=int(end))
+            else:
+                outages.append(Outage(machine=row, start_hour=int(start), end_hour=int(end)))
 
-    # TODO: We should merge overlapping and adjacent outages for a machine.
-    # Not a huge concern for a large mttf.
-    return [
-        Outage(machine=int(machine), start_hour=int(start), end_hour=int(end))
-        for machine, start, end in reshaped
-    ]
+            prev_end = end
+    return outages
 
 
 num_machines = 2
@@ -157,14 +162,83 @@ failure_starts = time_to_failure_exp_dist(
     mttf=hours(10),
     sim_duration=sim_duration)
 
-mean_time_to_repair = hours(2)
+mean_time_to_repair = hours(8)
 gen_machine_outages(
     failure_starts,
     lambda size: time_to_repair_uniform_dist(size, mean_time_to_repair),
 )
-# %%
-np.repeat(np.arange(3), 11)
 
+
+# %%
+
+@dataclass(frozen=True, order=True)
+class OutageClique:
+    """Outage cliques occur when multiple machines are down over the same time period."""
+    # Order is important, we want to sort by hours first.
+    start_hour: int
+    end_hour: int
+    machines: FrozenSet[int]
+
+
+def find_outage_cliques(
+        outages: List[Outage],
+        clique_size: int) -> List[OutageClique]:
+    """Finds all outage buddies where exactly cliqueSize machines were down
+    in the same time period.
+
+    The clique size will generally be the number of replicas.
+    """
+    if not outages:
+        return []
+
+    # Sort by start_hour, end_hour to enable a linear scan over outages.
+    # We only need to look at the next clique_size outages for each outage.
+    outages = sorted(outages)
+    cliques = []
+
+    for i in range(len(outages) - clique_size):
+        outage = outages[i]
+        clique_start = outage.start_hour
+        clique_end = outage.end_hour
+
+        for j in range(i + 1, i + clique_size):
+            next_outage = outages[j]
+            if next_outage.start_hour >= outage.end_hour:
+                break
+            # Found part of a clique.
+            # Update the start because next_outage.start must be greater
+            # than the prev outage.start because we sorted the list.
+            clique_start = next_outage.start_hour
+            # Use min because we're not sure which end is smaller.
+            clique_end = min(clique_end, next_outage.end_hour)
+        else:
+            # The inner loop didn't break, so we have a clique.
+            machines = set(x.machine for x in outages[i:i + clique_size])
+            assert len(machines) == clique_size, 'Found same machine in clique'
+            cliques.append(
+                OutageClique(
+                    start_hour=clique_start,
+                    end_hour=clique_end,
+                    machines=frozenset(machines)))
+    return cliques
+
+num_machines = 3
+sim_duration = hours(20)
+failure_starts = time_to_failure_exp_dist(
+    num_machines,
+    mttf=hours(10),
+    sim_duration=sim_duration)
+
+mean_time_to_repair = hours(8)
+outages = gen_machine_outages(
+    failure_starts,
+    lambda size: time_to_repair_uniform_dist(size, mean_time_to_repair),
+)
+print('gen_outages')
+print('\n'.join(str(o) for o in outages))
+print()
+clique_size = 2
+find_outage_cliques(outages, clique_size=clique_size)
 
 # %%
 @dataclass
@@ -173,10 +247,6 @@ class Partition:
     Each partition contains the same number of machines.
     """
     machines: List[int]
-
-
-def days(n: int):
-    return datetime.timedelta(days=n)
 
 
 assert num_machines % num_partitions == 0, "The number of machines must be divisible by the number of partitions."
@@ -232,23 +302,6 @@ class Overlap:
 
 
 # %%
-
-
-gen_machine_down_times(a, time_to_repair_dist)
-
-# %%
-
-num_machines = 2
-ttf = datetime.timedelta(hours=4)
-min_duration = datetime.timedelta(hours=30)
-gen_machine_failure_starts(num_machines, ttf, min_duration)
-
-fails = np.arange(20).reshape((2, 10))
-print(fails)
-repairs = time_to_repair_dist(20).reshape((2, 10))
-print(repairs)
-end_times = fails + repairs
-np.dstack((fails, end_times))
 
 
 # %%
