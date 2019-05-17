@@ -12,16 +12,15 @@ TODO: model mean time to failure as a distribution
 """
 # %% Imports
 import dataclasses
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, FrozenSet, NewType, Callable
+import itertools
 
-import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib as plt
 import datetime
-import random
+import humanize
 
 # %%
 
@@ -30,16 +29,6 @@ style = sns.set_style('whitegrid')
 plt.interactive(False)
 
 # %%
-NUM_SIMULATIONS = 10
-SIMULATION_DURATION = datetime.timedelta(days=365 * 4)
-
-NUM_MACHINES = 100
-NUM_PARTITIONS = 20
-MEAN_TIME_TO_FAILURE = datetime.timedelta(days=30 * 6)
-TIME_TO_REPAIR = datetime.timedelta(days=3)
-NUM_REPLICAS = 2
-NUM_DATA: int = int(1e5)
-RECOVERY_TIME = datetime.timedelta(days=7)
 
 # A one-dimensional, random distribution that takes a int size
 # and returns samples from the distribution.  For example, here's
@@ -132,11 +121,15 @@ class Outage:
 
 
 def gen_machine_outages(
-        failure_starts: np.ndarray,
-        time_to_repair_dist: RandomDist1dFn) -> List[Outage]:
+        num_machines: int,
+        mttf: datetime.timedelta,
+        time_to_repair_dist: RandomDist1dFn,
+        sim_duration: datetime.timedelta) -> List[Outage]:
     """Generates a list of outages from failure starts using a distribution to
     model the time to repair.
     """
+    failure_starts = time_to_failure_exp_dist(
+        num_machines, mttf=mttf, sim_duration=sim_duration)
     repair_times = time_to_repair_dist(failure_starts.size).reshape(failure_starts.shape)
     failure_ends = failure_starts + repair_times
     start_ends = np.dstack((failure_starts, failure_ends))
@@ -149,24 +142,14 @@ def gen_machine_outages(
                 prev_outage = outages[-1]
                 outages[-1] = dataclasses.replace(prev_outage, end_hour=int(end))
             else:
-                outages.append(Outage(machine=row, start_hour=int(start), end_hour=int(end)))
+                outages.append(
+                    Outage(machine=row, start_hour=int(start), end_hour=int(end)))
 
             prev_end = end
-    return outages
 
-
-num_machines = 2
-sim_duration = hours(15)
-failure_starts = time_to_failure_exp_dist(
-    num_machines,
-    mttf=hours(10),
-    sim_duration=sim_duration)
-
-mean_time_to_repair = hours(8)
-gen_machine_outages(
-    failure_starts,
-    lambda size: time_to_repair_uniform_dist(size, mean_time_to_repair),
-)
+    # Drop any outages outside the simulation duration.
+    sim_hours = total_hours(sim_duration)
+    return [o for o in outages if o.end_hour <= sim_hours]
 
 
 # %%
@@ -179,6 +162,25 @@ class OutageClique:
     end_hour: int
     machines: FrozenSet[int]
 
+    @staticmethod
+    def table_header():
+        def under(word):
+            return '=' * len(word)
+
+        return (f'{"start":<25} {"duration":<20} {"machines"}\n'
+                f'{under("start"):<25} {under("duration"):<20} '
+                f'{under("machines")}')
+
+    def format(self):
+        duration_secs = (self.end_hour - self.start_hour) * 3600
+        start = humanize.naturaldelta(self.start_hour * 3600)
+        duration = humanize.naturaldelta(duration_secs)
+        machines = ', '.join(str(m) for m in sorted(self.machines))
+        return (f'{start:<25} '
+                f'{duration:<20} '
+                f'{machines}')
+
+# %%
 
 def find_outage_cliques(
         outages: List[Outage],
@@ -219,163 +221,121 @@ def find_outage_cliques(
                 OutageClique(
                     start_hour=clique_start,
                     end_hour=clique_end,
-                    machines=frozenset(machines)))
+                    machines=frozenset(sorted(machines))))
     return cliques
 
-num_machines = 3
-sim_duration = hours(20)
-failure_starts = time_to_failure_exp_dist(
-    num_machines,
-    mttf=hours(10),
-    sim_duration=sim_duration)
-
-mean_time_to_repair = hours(8)
-outages = gen_machine_outages(
-    failure_starts,
-    lambda size: time_to_repair_uniform_dist(size, mean_time_to_repair),
-)
-print('gen_outages')
-print('\n'.join(str(o) for o in outages))
-print()
-clique_size = 2
-find_outage_cliques(outages, clique_size=clique_size)
 
 # %%
-@dataclass
-class Partition:
+
+@dataclass(frozen=True)
+class MachinePartition:
     """A partition is a group of machines.
-    Each partition contains the same number of machines.
+
+    Each partition contains the same number of machines which should equal the
+    number of replicas.
     """
-    machines: List[int]
+    machines: FrozenSet[int]
 
 
-assert num_machines % num_partitions == 0, "The number of machines must be divisible by the number of partitions."
-machines_per_part = num_machines // num_partitions
-assert machines_per_part >= num_replicas, "The number of machines per partition must exceed the replication factor."
+def gen_partitions(num_machines: int, num_partitions: int) -> List[MachinePartition]:
+    assert num_machines % num_partitions == 0, (
+        'The number of machines must be divisible by the number of partitions.')
+    m = num_machines // num_partitions
+    return [MachinePartition(frozenset(range(n * m, n * m + m)))
+            for n in range(num_partitions)]
 
-machine_locs = [list(range(n * machines_per_part, n * machines_per_part + machines_per_part)) for n in
-                range(num_partitions)]
-PARTITIONS = [Partition(locs) for locs in machine_locs]
 
-
-def distribute_data(n: int, replicas: int, parts: List[Partition]) -> Dict[FrozenSet[int], List[int]]:
-    """Places n pieces of data with the following constraints:
+def distribute_data(
+        num_machines: int,
+        num_partitions: int,
+        num_replicas: int,
+        num_data: int) -> Dict[FrozenSet[int], int]:
+    """Uniformly distributes n pieces of data in partitions.
 
     - Each piece of data is replicated `replicas` times.
     - Data is replicated on machines in the same partition.
     - Data is replicated on different machines within a partition.
     """
-    data_index = defaultdict(list)
-    for i in range(n):
-        partition = random.randrange(0, num_partitions)
-        population = parts[partition].machines
-        machines = frozenset(sorted(random.sample(population, k=replicas)))
-        data_index[machines].append(i)
+    assert num_machines % num_partitions == 0, (
+        'The number of machines must be divisible by the number of partitions.')
+    machines_per_part = num_machines // num_partitions
+    assert machines_per_part >= num_replicas, (
+        'The number of replicas cannot exceed machines per partition')
 
-    return data_index
+    # Create partitions and cliques.
+    partitions = gen_partitions(num_machines, num_partitions)
+    cliques = []
+    for partition in partitions:
+        for combo in itertools.combinations(partition.machines, num_replicas):
+            cliques.append(frozenset(combo))
 
+    data_per_clique = num_data / len(cliques)
+    assert data_per_clique > 1, 'must have at least 1 data per clique'
 
-DATA_DIST = distribute_data(num_data, replicas=num_replicas, parts=PARTITIONS)
+    # Probabilistically distribute data to avoid looping num_data times.
+    stddev = 0.05
+    data_dist = np.rint(np.random.normal(
+        data_per_clique, data_per_clique * stddev, len(cliques)))
+    counts = {}
+    for clique, count in zip(cliques, data_dist):
+        counts[clique] = count
 
-# %%
-# Check distribution of data across machines
-counts_per_machine = pd.Series(len(v) for v in DATA_DIST.values())
-assert counts_per_machine.count() == num_machines * num_replicas
-counts_per_machine.describe()
+    # Add or subtract data so it equals num_data.
+    total = np.sum(data_dist)
+    diff = int(num_data - total)
+    sign = np.sign(diff)
+    for i in range(abs(diff)):
+        c = cliques[i % len(cliques)]
+        counts[c] += sign
 
-# %%
-# Check distribution of data across machine pairs
-pd.Series(DATA_DIST.keys()).describe()
-
-
-# %%
-
-@dataclass
-class Overlap:
-    """An overlap is whenever two machines are down at the same time.
-
-    The machines are not necessarily related.
-    """
-    machines: FrozenSet[int]
-    start_hour: int
-    end_hour: int
-
-
-# %%
+    return counts
 
 
-# %%
-# We want a series for each machine of when it fails.
-# TODO: we want multiple failures for a machine in some period
-
-# Here's the first failure for each machine.
-def simulate() -> List[Outage]:
-    first_failures = np.around(np.random.exponential(time_to_failure.days * 24, num_machines))
-    first_failures.sort()
-    # TODO: we can use a distribution for repair time here.
-    repair_time = first_failures + time_to_repair.days * 24
-    machines = np.arange(num_machines)
-    np.random.shuffle(machines)
-    machine_fail_repair = np.transpose(np.vstack((machines, first_failures, repair_time)))
-
-    # Find all sets of overlaps.
-    overlaps = []
-    for i in range(1, num_machines):
-        hi_machine, hi_start, hi_end = machine_fail_repair[i]
-        for j in reversed(range(i - 1)):
-            lo_machine, lo_start, lo_end = machine_fail_repair[j]
-            if lo_end <= hi_start:
-                break
-            else:
-                overlaps.append(
-                    Overlap(
-                        machines=frozenset([int(lo_machine), int(hi_machine)]),
-                        start_hour=hi_start,
-                        end_hour=lo_end))
-
-    outages = []
-    for overlap in overlaps:
-        if overlap.machines in DATA_DIST:
-            outages.append(Outage(
-                machines=overlap.machines,
-                start_hour=overlap.start_hour,
-                end_hour=overlap.end_hour,
-                data=DATA_DIST[overlap.machines]
-            ))
-    return outages
-
-
-# %%
-num_outages = []
-for _ in range(100):
-    outages = simulate()
-    num_outages.append(len(outages))
-num_outages
-
-
-# %% Simulate failure
-def fail_machines(duration: datetime.timedelta, mttf: datetime.timedelta):
-    mttf_hours = mttf.total_seconds() / (60 * 60)
-    fail_prob = 1 / mttf_hours
-    return np.random.binomial(1, fail_prob, duration.days * 24)
-
-
-def should_fail(time_to_fail: datetime.timedelta) -> bool:
-    """Returns true if a failure should occur."""
-    return (1.0 / time_to_fail.days) < random.random()
-
-
-# %%
-sum(fail_machines(duration=days(30 * 6), mttf=days(10)) == 1)
-
-
-# %% Simulate day
-
-def simulate_hour():
-    pass
-
+a = distribute_data(
+    24,
+    3,
+    3,
+    10000)
 
 # %%
 
-# The number of days before you get 1000 successes in a row with a 10% chance.
-np.random.negative_binomial(1000, 0.1)
+NUM_SIMULATIONS = 10
+SIM_DURATION = datetime.timedelta(days=365 * 4)
+
+NUM_MACHINES = 100
+NUM_PARTITIONS = 20
+MEAN_TIME_TO_FAILURE = datetime.timedelta(days=30 * 10)
+MEAN_TIME_TO_REPAIR = datetime.timedelta(days=3)
+NUM_REPLICAS = 2
+NUM_DATA: int = int(1e6)
+RECOVERY_TIME = datetime.timedelta(days=7)
+
+
+def sim_time_to_repair_dist(size: int) -> np.ndarray:
+    return time_to_repair_uniform_dist(size, MEAN_TIME_TO_REPAIR)
+
+
+# %%
+failure_starts = time_to_failure_exp_dist(
+    NUM_MACHINES,
+    mttf=MEAN_TIME_TO_FAILURE,
+    sim_duration=SIM_DURATION)
+
+outages = gen_machine_outages(
+    num_machines=NUM_MACHINES,
+    mttf=MEAN_TIME_TO_FAILURE,
+    time_to_repair_dist=sim_time_to_repair_dist,
+    sim_duration=SIM_DURATION)
+
+outage_cliques = find_outage_cliques(outages, clique_size=NUM_REPLICAS)
+
+data_count_by_clique = distribute_data(
+    NUM_MACHINES, NUM_PARTITIONS, NUM_REPLICAS, NUM_DATA)
+
+full_outages = [oc for oc in outage_cliques if oc.machines in data_count_by_clique]
+print(f'Full outages: {len(full_outages)}')
+print()
+print(OutageClique.table_header())
+print('\n'.join(o.format() for o in full_outages))
+
+# %%
