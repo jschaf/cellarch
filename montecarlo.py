@@ -46,10 +46,14 @@ RECOVERY_TIME = datetime.timedelta(days=7)
 # stddev of 2:
 #
 #     lambda size: np.random.normal(5, 2, size)
-RandomDist1d = NewType('RandomDist', Callable[[int], np.ndarray])
+RandomDist1dFn = NewType('RandomDist', Callable[[int], np.ndarray])
 
 
-def to_hours(delta: datetime.timedelta) -> int:
+def hours(n: int) -> datetime.timedelta:
+    return datetime.timedelta(hours=n)
+
+
+def total_hours(delta: datetime.timedelta) -> int:
     """Converts a timedelta into the number of hours.
 
     Timedelta normalizes the delta into days, seconds and microseconds so
@@ -69,11 +73,11 @@ def time_to_failure_exp_dist(
     of columns.  The last value of each column is guaranteed to exceed the
     simulation duration.
     """
-    mttf_hours = to_hours(mttf)
-    sim_hours = to_hours(sim_duration)
+    mttf_hours = total_hours(mttf)
+    sim_hours = total_hours(sim_duration)
     # Use a generous fudge factor so we only have to drop columns, not add
     # new columns to ensure the last column > min_duration.
-    fudge_factor = 3
+    fudge_factor = 5
     num_cols = (sim_hours // mttf_hours) * fudge_factor
 
     # Add 1 to avoid having duplicate failure times if we get 0 from the
@@ -100,19 +104,66 @@ def time_to_repair_uniform_dist(
 
     Draws size samples. The min value is 1.
     """
-    mean = to_hours(time_to_repair)
+    mean = total_hours(time_to_repair)
     # Choose a reasonable stddev.
-    stddev = max(to_hours(time_to_repair) // 3, 1)
+    stddev = max(total_hours(time_to_repair) // 3, 1)
     normal_dist = np.random.normal(mean, scale=stddev, size=size)
     return np.clip(np.rint(normal_dist), a_min=1, a_max=None)
 
 
-time_to_failure_exp_dist(5, datetime.timedelta(hours=10), datetime.timedelta(hours=50))
+time_to_failure_exp_dist(5, mttf=hours(10), sim_duration=hours(50))
+
+
 # %%%
 
+@dataclass(frozen=True, order=True)
+class Outage:
+    """An outage is any period of time where a machine is down."""
+    # Order is important, we want to sort by hours first.
+    start_hour: int
+    end_hour: int
+    machine: int
 
-# time_to_repair_uniform_dist(5)
-np.nonzero(np.arange(5) > 3)
+
+def gen_machine_outages(
+        failure_starts: np.ndarray,
+        time_to_repair_dist: RandomDist1dFn) -> List[Outage]:
+    """Generates a list of outages from failure starts using a distribution to
+    model the time to repair..
+    """
+    num_rows = failure_starts.shape[0]
+    num_cols = failure_starts.shape[1]
+    machine_idxs = np.repeat(np.arange(num_rows), num_cols).reshape(failure_starts.shape)
+
+    repair_times = time_to_repair_dist(failure_starts.size).reshape(failure_starts.shape)
+    failure_ends = failure_starts + repair_times
+    start_end_idxs = np.dstack((machine_idxs, failure_starts, failure_ends))
+    # Flatten all but the last dimension to get [[start, end, machine], ...]
+    # https://stackoverflow.com/a/26553855/30900
+    reshaped = start_end_idxs.reshape(-1, start_end_idxs.shape[-1])
+
+    # TODO: We should merge overlapping and adjacent outages for a machine.
+    # Not a huge concern for a large mttf.
+    return [
+        Outage(machine=int(machine), start_hour=int(start), end_hour=int(end))
+        for machine, start, end in reshaped
+    ]
+
+
+num_machines = 2
+sim_duration = hours(15)
+failure_starts = time_to_failure_exp_dist(
+    num_machines,
+    mttf=hours(10),
+    sim_duration=sim_duration)
+
+mean_time_to_repair = hours(2)
+gen_machine_outages(
+    failure_starts,
+    lambda size: time_to_repair_uniform_dist(size, mean_time_to_repair),
+)
+# %%
+np.repeat(np.arange(3), 11)
 
 
 # %%
@@ -180,85 +231,7 @@ class Overlap:
     end_hour: int
 
 
-@dataclass
-class Outage:
-    """An outage is any period of time where two machines that share data are
-    down at the same time.
-
-    An outage is partial if the number of machines < NUM_REPLICAS.  An outage
-    is full if machines == NUM_REPLICAS.
-    """
-    machines: FrozenSet[int]
-    start_hour: int
-    end_hour: int
-    data: List[int]
-
-
 # %%
-
-
-def gen_machine_failure_starts(
-        num_machines: int,
-        time_to_failure_dist: RandomDist1d,
-) -> np.ndarray:
-    """Generates a two-dimensional array of increasing failure times of
-    integer hours from an exponential distribution.
-
-    The returned ndarray has `num_machines` rows.  Each row has the same
-    number of columns.  Each row is the cumulative sum (cumsum) of samples
-    from an exponential distribution using the mean time to failure, `mttf`.
-     The last value of each column is guaranteed to exceed min_duration.
-    """
-    assert num_machines > 0
-    all_failures = time_to_failure_dist(num_machines)
-    num_cols = len(all_failures[0])
-    reshaped = np.reshape(all_failures, (num_machines, num_cols))
-    summed = np.cumsum(reshaped, 1)
-    last_col = summed[:, -1]
-
-    # Drop excess columns
-    cols_to_keep = 0
-    for i in range(num_cols):
-        cols_to_keep += 1
-        min_val = np.min(summed[:, i])
-        if min_val >= duration_hours:
-            break
-    return np.delete(summed, np.s_[cols_to_keep:], axis=1)
-
-
-num_machines = 2
-ttf = datetime.timedelta(hours=4)
-min_duration = datetime.timedelta(hours=30)
-a = gen_machine_failure_starts(num_machines, ttf, min_duration)
-print(a)
-
-
-def gen_machine_down_times(
-        failure_starts: np.ndarray,
-        down_time_dist: RandomDist1d) -> np.ndarray:
-    """Generates a ragged 2d array of 2-element [start_time, end_time] pairs
-    from failure_starts indexed the machine number.
-
-    Each row represents the failures for a single machine.  Each column within
-    the row contains two-element array of [start_time, end_time].
-
-    The returned ndarray is transformed by:
-
-    1.  Replacing each cell in the two-dimensional failure_starts ndarray
-        with two-element array of the failure start time and the failure
-        end time given by (start_time + down_time).
-
-    2.  Coalescing overlapping and immediately adjacent failures into a single
-        two dimensional array.  For example, [[1, 5], [5, 10]] is coalesced
-        into [[1, 10]].
-    """
-
-    repair_times = down_time_dist(failure_starts.size).reshape(failure_starts.shape)
-    failure_ends = failure_starts + repair_times
-    # TODO: coalesce adjacent and overlapping down-time ranges
-    # It's unlikely enough for large mttf that probably okay to
-    # ignore
-    return np.dstack((failure_starts, failure_ends))
 
 
 gen_machine_down_times(a, time_to_repair_dist)
