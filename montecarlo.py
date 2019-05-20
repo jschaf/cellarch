@@ -430,8 +430,9 @@ def run_sim(cfg: SimConfig) -> SimResult:
         full_outages=full_outages,
     )
 
+
 # %%
-base_config = SimConfig(
+BASE_CONFIG = SimConfig(
     num_machines=70,
     sim_duration=years(70),
     num_partitions=14,
@@ -441,30 +442,87 @@ base_config = SimConfig(
     time_to_repair_dist=lambda size: uniform_dist(days(3), hours(6), size)
 )
 
-num_sims = 100
 
-first_outages = collections.defaultdict(list)
-bi_annual_months = range(6, 5 * 12 + 1, 6)
-for month in bi_annual_months:
-    cfg = dataclasses.replace(
-        base_config,
-        time_to_failure_dist=lambda size: exp_dist(months(month), size))
-    for _ in range(num_sims):
-        result = run_sim(cfg)
-        # If there's a lot of variance, their might not be any full outages
-        # so use the sim duration instead.
-        fail_start_months = total_days(cfg.sim_duration) / 365
-        if result.full_outages:
-            hour = result.full_outages[0].start_hour
-            fail_start_months = hour / (24 * 365)
+# %%
+# See what happens if we vary the time to failure.
+def sim_outages_per_mttf(
+        num_sims: int,
+        base_config: SimConfig) -> Dict[int, List[float]]:
+    outages_by_mttf = collections.defaultdict(list)
+    bi_annual_months = range(6, 5 * 12 + 1, 6)
+    for month in bi_annual_months:
+        cfg = dataclasses.replace(
+            base_config,
+            time_to_failure_dist=lambda size: exp_dist(months(month), size))
+        for _ in range(num_sims):
+            # If there's a lot of variance, there might not be any full outages
+            # so use the sim duration instead.
+            first_failure = total_hours(cfg.sim_duration)
+            result = run_sim(cfg)
+            if result.full_outages:
+                first_failure = result.full_outages[0].start_hour
 
-        first_outages[month].append(fail_start_months)
+            outages_by_mttf[month].append(first_failure / (24 * 365))
+    return outages_by_mttf
+
+
+outages_per_mttf = sim_outages_per_mttf(
+    num_sims=100, base_config=BASE_CONFIG)
+
+# Hard to see y-axis with all months so truncate data a bit.
+outages_per_mttf_30_months = {k: v for k, v in outages_per_mttf.items() if k <= 30}
 
 # %%
 plt.interactive(False)
-ax = pd.DataFrame(first_outages).boxplot()
-plt.pyplot.title('Time to data unavailability in distributed storage system')
-plt.pyplot.xlabel('Time to machine failure in months with an exponential distribution')
+pd.DataFrame(outages_per_mttf).boxplot()
+plt.pyplot.title('Time to data unavailability by machine MTTF')
+plt.pyplot.xlabel('Machine mean time to failure in months with an exponential distribution')
 plt.pyplot.ylabel('Time to data unavailability in years')
-plt.pyplot.savefig('plot-60months.png', dpi=300)
+plt.pyplot.savefig('outages-by-mttf-60-months.png', dpi=300)
+plt.pyplot.show()
+
+pd.DataFrame(outages_per_mttf_30_months).boxplot()
+plt.pyplot.title('Time to data unavailability by machine MTTF')
+plt.pyplot.xlabel('Machine mean time to failure in months with an exponential distribution')
+plt.pyplot.ylabel('Time to data unavailability in years')
+plt.pyplot.savefig('outages-by-mttf-30-months.png', dpi=300)
+plt.pyplot.show()
+
+
+# %%
+def sim_outages_per_num_partitions(
+        num_sims,
+        base_config: SimConfig) -> Dict[int, List[float]]:
+    """See what happens if we vary the number of partitions."""
+    # Create an abundant number (one that has many divisors) so there's more
+    # partitions that evenly divide the number of partitions.
+    num_machines = 60
+
+    outages_by_partition = collections.defaultdict(list)
+    for partition in [1, 2, 3, 4, 5, 10, 12, 15, 20, 30]:
+        cfg = dataclasses.replace(
+            base_config, num_machines=num_machines, num_partitions=partition)
+        for _ in range(num_sims):
+            # If there's a lot of variance, there might not be any full outages
+            # so default to the sim duration.
+            first_failure = total_hours(cfg.sim_duration)
+            result = run_sim(cfg)
+            if result.full_outages:
+                first_failure = result.full_outages[0].start_hour
+
+            outages_by_partition[partition].append(first_failure / (24 * 365))
+
+    return outages_by_partition
+
+
+outages_per_partition = sim_outages_per_num_partitions(
+    num_sims=100, base_config=BASE_CONFIG)
+
+# %%
+plt.interactive(False)
+pd.DataFrame(outages_per_partition).boxplot()
+plt.pyplot.title('Time to data unavailability by number of partitions')
+plt.pyplot.xlabel('Number of distinct partitions')
+plt.pyplot.ylabel('Time to data unavailability in years')
+plt.pyplot.savefig('outages-by-partition.png', dpi=300)
 plt.pyplot.show()
