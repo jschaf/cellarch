@@ -87,12 +87,12 @@ def total_months(delta: datetime.timedelta) -> int:
     return total_days(delta) // 30
 
 
-def time_to_failure_exp_dist(
+def gen_machine_failure_starts(
         num_machines: int,
-        mttf: datetime.timedelta,
+        failure_dist: RandomDistFn,
         sim_duration: datetime.timedelta) -> np.ndarray:
     """Generates a two-dimensional array of monotonically increasing failure
-    times of integer hours from an exponential distribution.
+    times of integer hours from the give failure distribution.
 
     The returned ndarray has `num_machines` rows.  Each row represents the
     start times of failures for a single machine.  Each row has the same number
@@ -126,17 +126,16 @@ def time_to_failure_exp_dist(
 
     [1]: http://static.googleusercontent.com/media/research.google.com/en//pubs/archive/36737.pdf
     """
-    mttf_hours = total_hours(mttf)
     sim_hours = total_hours(sim_duration)
     # Use a generous fudge factor so we only have to drop columns, not add
     # new columns to ensure the min(last_column) > sim_duration.  Surely, there's
     # a cleaner way to do this.
     fudge_factor = 10
-    num_cols = (sim_hours // mttf_hours) * fudge_factor
+    # Assume machines last at least 1 month
+    hours_per_month = 24 * 30
+    num_cols = (sim_hours // hours_per_month) * fudge_factor
 
-    # Add 1 to avoid having duplicate failure times if we get 0 from the
-    # exponential distribution.
-    all_failures = np.rint(np.random.exponential(mttf_hours, num_machines * num_cols)) + 1
+    all_failures = failure_dist(num_machines * num_cols)
     reshaped = np.reshape(all_failures, (num_machines, num_cols))
     summed = np.cumsum(reshaped, 1)
 
@@ -150,19 +149,29 @@ def time_to_failure_exp_dist(
     return np.delete(summed, np.s_[cols_to_keep:], axis=1)
 
 
-def time_to_repair_uniform_dist(
-        size: int,
-        time_to_repair: datetime.timedelta) -> np.ndarray:
-    """Returns an one-dimensional array of integer hours of the times to repair
-    drawn from a normal distribution with a mean of time_to_repair.
+def uniform_dist(
+        mean: datetime.timedelta,
+        stddev: datetime.timedelta,
+        size: int) -> np.ndarray:
+    """Returns an one-dimensional array of integers drawn from a normal
+    distribution.
 
-    The min value is 1 and the standard deviation is a percentage of the mean.
+    The min value is 1.
     """
-    mean = total_hours(time_to_repair)
-    # Choose a reasonable stddev.
-    stddev = max(total_hours(time_to_repair) // 3, 1)
-    normal_dist = np.random.normal(mean, scale=stddev, size=size)
+    mean_hours = total_hours(mean)
+    stddev_hours = total_hours(stddev)
+    normal_dist = np.random.normal(mean_hours, scale=stddev_hours, size=size)
     return np.clip(np.rint(normal_dist), a_min=1, a_max=None)
+
+
+def exp_dist(scale: datetime.timedelta, size: int) -> np.ndarray:
+    """Returns an one-dimensional array of integers drawn from an exponential
+    distribution.
+
+    The min value is 1.
+    """
+    exp = np.random.exponential(total_hours(scale), size)
+    return np.clip(np.rint(exp), a_min=1, a_max=None)
 
 
 # %%%
@@ -176,10 +185,9 @@ class Outage:
     machine: int
 
 
-# TODO: allow the machine outages as a parameter similar to time_to_repair_dist.
 def gen_machine_outages(
         num_machines: int,
-        mttf: datetime.timedelta,
+        time_to_failure_dist: RandomDistFn,
         time_to_repair_dist: RandomDistFn,
         sim_duration: datetime.timedelta) -> List[Outage]:
     """Generates a list of outages for num_machines.
@@ -188,8 +196,11 @@ def gen_machine_outages(
     mean time to failure (mttf).  The outage duration is failure start time plus
     the duration in hours drawn from time_to_repair_dist.
     """
-    failure_starts = time_to_failure_exp_dist(
-        num_machines, mttf=mttf, sim_duration=sim_duration)
+    failure_starts = gen_machine_failure_starts(
+        num_machines=num_machines,
+        failure_dist=time_to_failure_dist,
+        sim_duration=sim_duration,
+    )
     repair_times = time_to_repair_dist(failure_starts.size).reshape(failure_starts.shape)
     failure_ends = failure_starts + repair_times
     start_ends = np.dstack((failure_starts, failure_ends))
@@ -222,8 +233,8 @@ class OutageClique:
     The start_hour for a clique is max of each MachineOutage.start_hour.
     The end_hour for a clique is the min of each MachineOutage.end_hour.
     In other words, the duration from start_hour to end_hour is guaranteed
-    to be fully contained in individual machine outage that constitute this
-    clique.
+    to be fully contained in each individual machine outage that contributes
+    to this clique.
     """
     # Order is important, we want to sort by hours first.
     start_hour: int
@@ -250,7 +261,6 @@ class OutageClique:
 
 
 # %%
-
 def find_outage_cliques(
         outages: List[Outage],
         clique_size: int) -> List[OutageClique]:
@@ -365,58 +375,56 @@ def distribute_data(
 
 
 # %%
-NUM_SIMULATIONS = 10
-SIM_DURATION = datetime.timedelta(days=365 * 8)
-
-NUM_MACHINES = 70
-NUM_PARTITIONS = 14
-MEAN_TIME_TO_FAILURE = datetime.timedelta(days=30 * 12 * 2)
-MEAN_TIME_TO_REPAIR = datetime.timedelta(days=2)
-NUM_REPLICAS = 2
-NUM_DATA: int = int(1e6)
+@dataclass(frozen=True)
+class OutageStats:
+    """Information about outages for a simulation."""
+    all_outages: List[Outage]
+    full_outages: List[OutageClique]
 
 
-def sim_time_to_repair_dist(size: int) -> np.ndarray:
-    """Curry a time to repair distribution function so it matches the
-    RandomDistFn signature."""
-    return time_to_repair_uniform_dist(size, MEAN_TIME_TO_REPAIR)
+@dataclass(frozen=True)
+class SimConfig:
+    """Configuration info for how to run a simulation."""
+    num_machines: int
+    sim_duration: datetime.timedelta
+    num_partitions: int
+    num_replicas: int
+    num_data: int
+    time_to_failure_dist: RandomDistFn
+    time_to_repair_dist: RandomDistFn
+
+
+def run_sim(cfg: SimConfig) -> OutageStats:
+    data_count_by_clique = distribute_data(
+        cfg.num_machines, cfg.num_partitions, cfg.num_replicas, cfg.num_data)
+    outages = gen_machine_outages(
+        num_machines=cfg.num_machines,
+        time_to_failure_dist=cfg.time_to_failure_dist,
+        time_to_repair_dist=cfg.time_to_repair_dist,
+        sim_duration=cfg.sim_duration,
+    )
+    outage_cliques = find_outage_cliques(outages, clique_size=cfg.num_replicas)
+    full_outages = [
+        oc for oc in outage_cliques if oc.machines in data_count_by_clique
+    ]
+
+    return OutageStats(
+        all_outages=outages,
+        full_outages=full_outages,
+    )
 
 
 # %%
-failure_starts = time_to_failure_exp_dist(
-    NUM_MACHINES,
-    mttf=MEAN_TIME_TO_FAILURE,
-    sim_duration=SIM_DURATION)
+sim_config = SimConfig(
+    num_machines=70,
+    sim_duration=days(365 * 10),
+    num_partitions=14,
+    num_replicas=2,
+    num_data=int(1e6),
+    time_to_failure_dist=lambda size: exp_dist(days(30 * 6), size),
+    time_to_repair_dist=lambda size: uniform_dist(days(3), hours(6), size)
+)
 
-outages = gen_machine_outages(
-    num_machines=NUM_MACHINES,
-    mttf=MEAN_TIME_TO_FAILURE,
-    time_to_repair_dist=sim_time_to_repair_dist,
-    sim_duration=SIM_DURATION)
-
-outage_cliques = find_outage_cliques(outages, clique_size=NUM_REPLICAS)
-
-data_count_by_clique = distribute_data(
-    NUM_MACHINES, NUM_PARTITIONS, NUM_REPLICAS, NUM_DATA)
-
-full_outages = [
-    oc for oc in outage_cliques if oc.machines in data_count_by_clique
-]
-
-print(f"""Simulating outages for cell architecture.
-
-SIM_DURATION: {total_months(SIM_DURATION)} months
-NUM_MACHINES: {NUM_MACHINES}
-NUM_PARTITIONS: {NUM_PARTITIONS}
-NUM_REPLICAS: {NUM_REPLICAS}
-NUM_DATA: {NUM_DATA}
-
-MEAN_TIME_TO_FAILURE: {total_months(MEAN_TIME_TO_FAILURE)} months
-MEAN_TIME_TO_REPAIR: {total_days(MEAN_TIME_TO_REPAIR)} days
-""")
-print(f'Number of outages (including partial): {len(outages)}')
-
-print(f'Number of outages with data completely unavailable: {len(full_outages)}')
-print()
+outage_stats = run_sim(sim_config)
 print(OutageClique.table_header())
-print('\n'.join(o.format() for o in full_outages))
+print('\n'.join(o.format() for o in outage_stats.full_outages))
