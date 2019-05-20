@@ -35,6 +35,7 @@ In broad strokes, the simulation proceeds as follows:
 
 """
 # %% Imports
+import collections
 import dataclasses
 from dataclasses import dataclass
 from typing import Dict, List, FrozenSet, NewType, Callable
@@ -42,6 +43,8 @@ import itertools
 
 import datetime
 import numpy as np
+import pandas as pd
+import matplotlib as plt
 import humanize
 
 # %%
@@ -59,9 +62,21 @@ def hours(n: int) -> datetime.timedelta:
     return datetime.timedelta(hours=n)
 
 
-def days(n: int):
+def days(n: int) -> datetime.timedelta:
     """Creates a timedelta of exactly n days."""
     return datetime.timedelta(days=n)
+
+
+def months(n: int) -> datetime.timedelta:
+    """Creates a timedelta of n months where a month is defined as
+    30.5 days."""
+    return days(int(n * 30.5))
+
+
+def years(n: int) -> datetime.timedelta:
+    """Creates a timedelta of n years where a year is defined as
+    365 days."""
+    return days(n * 365)
 
 
 def total_hours(delta: datetime.timedelta) -> int:
@@ -84,7 +99,7 @@ def total_months(delta: datetime.timedelta) -> int:
     """Converts a timedelta into the total number of months.
 
     See total_hours."""
-    return total_days(delta) // 30
+    return int(total_days(delta) / 30.5)
 
 
 def gen_machine_failure_starts(
@@ -376,13 +391,6 @@ def distribute_data(
 
 # %%
 @dataclass(frozen=True)
-class OutageStats:
-    """Information about outages for a simulation."""
-    all_outages: List[Outage]
-    full_outages: List[OutageClique]
-
-
-@dataclass(frozen=True)
 class SimConfig:
     """Configuration info for how to run a simulation."""
     num_machines: int
@@ -394,7 +402,15 @@ class SimConfig:
     time_to_repair_dist: RandomDistFn
 
 
-def run_sim(cfg: SimConfig) -> OutageStats:
+@dataclass(frozen=True)
+class SimResult:
+    """Information about outages for a simulation."""
+    config: SimConfig
+    all_outages: List[Outage]
+    full_outages: List[OutageClique]
+
+
+def run_sim(cfg: SimConfig) -> SimResult:
     data_count_by_clique = distribute_data(
         cfg.num_machines, cfg.num_partitions, cfg.num_replicas, cfg.num_data)
     outages = gen_machine_outages(
@@ -408,23 +424,47 @@ def run_sim(cfg: SimConfig) -> OutageStats:
         oc for oc in outage_cliques if oc.machines in data_count_by_clique
     ]
 
-    return OutageStats(
+    return SimResult(
+        config=cfg,
         all_outages=outages,
         full_outages=full_outages,
     )
 
-
 # %%
-sim_config = SimConfig(
+base_config = SimConfig(
     num_machines=70,
-    sim_duration=days(365 * 10),
+    sim_duration=years(70),
     num_partitions=14,
     num_replicas=2,
     num_data=int(1e6),
-    time_to_failure_dist=lambda size: exp_dist(days(30 * 6), size),
+    time_to_failure_dist=lambda size: exp_dist(years(4), size),
     time_to_repair_dist=lambda size: uniform_dist(days(3), hours(6), size)
 )
 
-outage_stats = run_sim(sim_config)
-print(OutageClique.table_header())
-print('\n'.join(o.format() for o in outage_stats.full_outages))
+num_sims = 100
+
+first_outages = collections.defaultdict(list)
+bi_annual_months = range(6, 5 * 12 + 1, 6)
+for month in bi_annual_months:
+    cfg = dataclasses.replace(
+        base_config,
+        time_to_failure_dist=lambda size: exp_dist(months(month), size))
+    for _ in range(num_sims):
+        result = run_sim(cfg)
+        # If there's a lot of variance, their might not be any full outages
+        # so use the sim duration instead.
+        fail_start_months = total_days(cfg.sim_duration) / 365
+        if result.full_outages:
+            hour = result.full_outages[0].start_hour
+            fail_start_months = hour / (24 * 365)
+
+        first_outages[month].append(fail_start_months)
+
+# %%
+plt.interactive(False)
+ax = pd.DataFrame(first_outages).boxplot()
+plt.pyplot.title('Time to data unavailability in distributed storage system')
+plt.pyplot.xlabel('Time to machine failure in months with an exponential distribution')
+plt.pyplot.ylabel('Time to data unavailability in years')
+plt.pyplot.savefig('plot-60months.png', dpi=300)
+plt.pyplot.show()
