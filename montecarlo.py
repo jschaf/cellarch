@@ -137,10 +137,10 @@ def gen_machine_failure_starts(
     """Generates a three-dimensional array of monotonically increasing failure
     times of integer hours from the give failure distribution.
 
-    The returned ndarray has `num_machines` rows.  Each row represents the
-    start times of failures for a single machine.  Each row has the same number
-    of columns.  The last value of each column is guaranteed to exceed the
-    simulation duration.
+    The returned ndarray has shape (num_iterations, num_machines, COLS) rows.
+    Each row in an iteration represents the start times of failures for a single
+    machine.  Each row has the same number of columns.  The last value of each
+    column is guaranteed to be less than the simulation duration.
 
     For example, for 2 machines this method might produce:
 
@@ -149,25 +149,7 @@ def gen_machine_failure_starts(
     Meaning machine 0 has a failures that start at hours 1, 5, and 22.
     Machine 1 has failures that start at hours 7, 9, and 15.
 
-    The exponential distribution is a good candidate for the reasons described
-    in 'Availability in Globally Distributed Storage Systems' [1].
-
-    > The exponential distribution is a reasonable approximation for the
-    > following reasons. First, the Weibull distribution is a generalization
-    > of the exponential distribution that allows the rate parameter to
-    > increase over time to reflect the aging of disks. In a large
-    > population of disks, the mixture of disks of different ages tends to
-    > be stable, and so the average failure rate in a cell tends to be
-    > constant. When the failure rate is stable, the Weibull distribution
-    > provides the same quality of fit as the exponential. Second, disk
-    > failures make up only a small subset of failures that we examined, and
-    > model results indicate that overall availability is not particularly
-    > sensitive to them. Finally, other authors ([24]) have concluded that
-    > correlation and non-homogeneity of the recovery rate and the mean time
-    > to a failure event have a much smaller impact on system-wide
-    > availability than the size of the event.
-
-    [1]: http://static.googleusercontent.com/media/research.google.com/en//pubs/archive/36737.pdf
+    The failure times are drawn from the time_to_failure_dist.
     """
     min_hours = total_hours(sim_duration)
     num_rows = num_iterations * num_machines
@@ -305,95 +287,78 @@ def gen_machine_outages(
     return splits
 
 
-seedSet = 1558056445
+seedSet = 1558056446
 np.random.seed(seedSet)
-gen_machine_outages(
+a = gen_machine_outages(
     num_iterations=2,
     num_machines=2,
     time_to_failure_dist=lambda size: normal_dist(hours(1), hours(6), size),
     time_to_repair_dist=lambda size: exp_dist(hours(3), size),
-    sim_duration=hours(10))
+    sim_duration=hours(20))
+print('orig', a)
 
 
-# %%
-@dataclass(frozen=True, order=True)
-class OutageClique:
-    """An outage clique s when multiple machines are down over the same
-    time period.
-
-    The start_hour for a clique is max of each MachineOutage.start_hour.
-    The end_hour for a clique is the min of each MachineOutage.end_hour.
-    In other words, the duration from start_hour to end_hour is guaranteed
-    to be fully contained in each individual machine outage that contributes
-    to this clique.
-    """
-    # Order is important, we want to sort by hours first.
-    start_hour: int
-    end_hour: int
-    machines: FrozenSet[int]
-
-    @staticmethod
-    def table_header():
-        def under(word):
-            return '=' * len(word)
-
-        return (f'{"outage start":<25} {"duration":<20} {"machines"}\n'
-                f'{under("outage start"):<25} {under("duration"):<20} '
-                f'{under("machines")}')
-
-    def format(self):
-        duration_secs = (self.end_hour - self.start_hour) * 3600
-        start = humanize.naturaldelta(self.start_hour * 3600)
-        duration = humanize.naturaldelta(duration_secs)
-        machines = ', '.join(str(m) for m in sorted(self.machines))
-        return (f'{start:<25} '
-                f'{duration:<20} '
-                f'{machines}')
-
-
-# %%
 def find_outage_cliques(
-        outages: List[Outage],
-        clique_size: int) -> List[OutageClique]:
-    """Finds all outage buddies where exactly clique_size machines were down
-    in the same time period.
+        all_outages: List[np.ndarray],
+        num_machines: int,
+        num_partitions: int,
+        num_replicas: int) -> List[np.ndarray]:
+    """Finds outage cliques when multiple machines are down over the same
+    time period that are in the same partition.
 
-    The clique size will generally be the number of replicas because that
-    potentially indicates that data is completely unavailable.
+    Each element in the return list is all the outage cliques for a single
+    iteration.  Each element in the ndarray is:
+
+        [start_hour, end_hour, machine_1, machine_2]
+
+    Only a clique size of 2 (corresponding to num_machines // num_partitions)
+    is supported.
     """
-    # Precondition: outages must be sorted by start_hour. This is done when
-    # generating data since we use cumulative sum.
-    if not outages:
-        return []
+    machines_per_part = num_machines // num_partitions
+    return [find_outage_cliques_single(o, machines_per_partition=machines_per_part, clique_size=num_replicas)
+            for o in all_outages]
 
-    cliques = []
 
-    for i in range(len(outages) - clique_size):
-        outage = outages[i]
-        clique_start = outage.start_hour
-        clique_end = outage.end_hour
+def find_outage_cliques_single(
+        outages: np.ndarray,
+        machines_per_partition: int,
+        clique_size: int) -> np.ndarray:
+    assert clique_size <= 2, 'Larger clique sizes than 2 unsupported'
+    # Sort by start and end column. Requires structured arrays.
+    # https://stackoverflow.com/questions/2828059
+    view = outages.view(dtype=[('start', 'f8'), ('end', 'f8'), ('id', 'f8')])
+    view.sort(order=['start', 'end'], axis=0)
 
-        for j in range(i + 1, i + clique_size):
-            next_outage = outages[j]
-            if next_outage.start_hour >= outage.end_hour:
-                break
-            # Found part of a clique.
-            # Update the start because next_outage.start must be greater
-            # than the prev outage.start because we sorted the list.
-            clique_start = next_outage.start_hour
-            # Use min because we're not sure which end is smaller.
-            clique_end = min(clique_end, next_outage.end_hour)
-        else:
-            # The Python for-else statement means the inner loop didn't break,
-            # so we found a clique.
-            machines = frozenset(x.machine for x in outages[i:i + clique_size])
-            assert len(machines) == clique_size, 'Found same machine in clique'
-            cliques.append(
-                OutageClique(
-                    start_hour=clique_start,
-                    end_hour=clique_end,
-                    machines=machines))
-    return cliques
+    starts = outages[:, 0]
+    ends = outages[:, 1]
+    machines = outages[:, 2]
+
+    starts_shift = np.roll(starts, -1, axis=0)
+    # Use a large value so it appears as False in the mask.
+    starts_shift[-1] = ends[-1]
+    ends_shift = np.roll(ends, -1, axis=0)
+    machines_shift = np.roll(machines, -1, axis=0)
+
+    mask = ends - starts_shift > 0
+    # Mask out machines that aren't in the same partition.
+    m1 = machines // machines_per_partition
+    m2 = machines_shift // machines_per_partition
+    same_partition_mask = m1 == m2
+    mask &= same_partition_mask
+
+    outage_starts = starts_shift[mask]
+    outage_ends = np.min(np.dstack((ends, ends_shift)), axis=2)[0][mask]
+    outage_m1 = machines[mask]
+    outage_m2 = machines_shift[mask]
+    return np.dstack((outage_starts, outage_ends, outage_m1, outage_m2))[0]
+
+
+find_outage_cliques_single(a[0], clique_size=2, machines_per_partition=2)
+
+
+# %%
+
+# %%
 
 
 # %%
@@ -482,42 +447,26 @@ class SimConfig:
 class SimResult:
     """Information about outages for a simulation."""
     config: SimConfig
-    first_failure: datetime.timedelta
-    all_outages: List[Outage]
-    full_outages: List[OutageClique]
+    full_outages: List[np.ndarray]
 
 
-def run_sim(cfg: SimConfig) -> List[SimResult]:
+def run_sim(cfg: SimConfig) -> SimResult:
     """Runs the simulation according to params in cfg.
 
     The returned list is exactly SimConfig.num_iterations long."""
-    data_count_by_clique = distribute_data(
-        cfg.num_machines, cfg.num_partitions, cfg.num_replicas, cfg.num_data)
-    all_sim_duration = cfg.sim_duration * cfg.num_iterations
-    all_outages = gen_machine_outages(num_iterations=all_sim_duration, num_machines=,
-                                      time_to_failure_dist=cfg.num_machines,
-                                      time_to_repair_dist=cfg.time_to_failure_dist,
-                                      sim_duration=cfg.time_to_repair_dist)
+    all_outages = gen_machine_outages(
+        num_iterations=cfg.num_iterations,
+        num_machines=cfg.num_machines,
+        time_to_failure_dist=cfg.time_to_failure_dist,
+        time_to_repair_dist=cfg.time_to_repair_dist,
+        sim_duration=cfg.sim_duration)
+    all_cliques = find_outage_cliques(
+        all_outages,
+        num_machines=cfg.num_machines,
+        num_partitions=cfg.num_partitions,
+        num_replicas=cfg.num_replicas)
 
-    sim_hours = total_hours(cfg.sim_duration)
-    sim_end_hours = range(sim_hours - 1, total_hours(all_sim_duration), sim_hours)
-
-    lo = 0,
-    hi = 1
-    for i, end in enumerate(sim_end_hours):
-        bisect.bisect_right(all_outages, 0)
-        pass
-
-    outage_cliques = find_outage_cliques(outages, clique_size=cfg.num_replicas)
-    full_outages = [
-        oc for oc in outage_cliques if oc.machines in data_count_by_clique
-    ]
-
-    return SimResult(
-        config=cfg,
-        all_outages=outages,
-        full_outages=full_outages,
-    )
+    return SimResult(config=cfg, full_outages=all_cliques)
 
 
 # %%
@@ -534,78 +483,82 @@ BASE_CONFIG = SimConfig(
 
 
 # %%
-# See what happens if we vary the time to failure.
-def sim_outages_per_mttf(
-        base_config: SimConfig) -> Dict[int, List[float]]:
+def sim_outages_per_mttf(base_cfg: SimConfig) -> Dict[int, List[float]]:
+    """See what happens if we vary the time to failure."""
     outages_by_mttf = collections.defaultdict(list)
+
     bi_annual_months = range(6, 5 * 12 + 1, 6)
     for month in bi_annual_months:
         cfg = dataclasses.replace(
-            base_config,
+            base_cfg,
             time_to_failure_dist=lambda size: exp_dist(months(month), size))
-        for _ in range(cfg.num_iterations):
-            # If there's a lot of variance, there might not be any full outages
-            # so use the sim duration instead.
-            first_failure = total_hours(cfg.sim_duration)
-            result = run_sim(cfg)
-            if result.full_outages:
-                first_failure = result.full_outages[0].start_hour
 
-            outages_by_mttf[month].append(first_failure / (24 * 365))
+        result = run_sim(cfg)
+        for outages in result.full_outages:
+            # If there's a lot of variance, there might not be any full outages
+            # so default the sim duration instead.
+            first_fail = total_hours(cfg.sim_duration)
+            if outages.size > 0:
+                first_fail = outages[0, 0]
+            outages_by_mttf[month].append(first_fail / (24 * 365))
+
     return outages_by_mttf
 
 
-# outages_per_mttf = sim_outages_per_mttf(base_config=BASE_CONFIG)
-#
-# # Hard to see y-axis with all months so truncate data a bit.
-# outages_per_mttf_30_months = {k: v for k, v in outages_per_mttf.items() if k <= 30}
+# %%
+outages_per_mttf = sim_outages_per_mttf(BASE_CONFIG)
+
+# Hard to see y-axis with all months so truncate data a bit.
+outages_per_mttf_30_months = {k: v for k, v in outages_per_mttf.items() if k <= 30}
+
 
 # %%
-# plt.interactive(False)
-# pd.DataFrame(outages_per_mttf).boxplot()
-# plt.pyplot.title('Time to data unavailability by machine MTTF')
-# plt.pyplot.xlabel('Machine mean time to failure in months with an exponential distribution')
-# plt.pyplot.ylabel('Time to data unavailability in years')
-# plt.pyplot.savefig('outages-by-mttf-60-months.png', dpi=300)
-# plt.pyplot.show()
-#
-# pd.DataFrame(outages_per_mttf_30_months).boxplot()
-# plt.pyplot.title('Time to data unavailability by machine MTTF')
-# plt.pyplot.xlabel('Machine mean time to failure in months with an exponential distribution')
-# plt.pyplot.ylabel('Time to data unavailability in years')
-# plt.pyplot.savefig('outages-by-mttf-30-months.png', dpi=300)
-# plt.pyplot.show()
-#
-#
-# # %%
-# def sim_outages_per_num_partitions(
-#         num_sims,
-#         base_config: SimConfig) -> Dict[int, List[float]]:
-#     """See what happens if we vary the number of partitions."""
-#     # Create an abundant number (one that has many divisors) so there's more
-#     # partitions that evenly divide the number of partitions.
-#     num_machines = 60
-#
-#     outages_by_partition = collections.defaultdict(list)
-#     for partition in [1, 2, 3, 4, 5, 10, 12, 15, 20, 30]:
-#         cfg = dataclasses.replace(
-#             base_config, num_machines=num_machines, num_partitions=partition)
-#         for _ in range(num_sims):
-#             # If there's a lot of variance, there might not be any full outages
-#             # so default to the sim duration.
-#             first_failure = total_hours(cfg.sim_duration)
-#             result = run_sim(cfg)
-#             if result.full_outages:
-#                 first_failure = result.full_outages[0].start_hour
-#
-#             outages_by_partition[partition].append(first_failure / (24 * 365))
-#
-#     return outages_by_partition
-#
-#
-# outages_per_partition = sim_outages_per_num_partitions(
-#     num_sims=100, base_config=BASE_CONFIG)
-#
+plt.interactive(False)
+pd.DataFrame(outages_per_mttf).boxplot()
+plt.pyplot.title('Time to data unavailability by machine MTTF')
+plt.pyplot.xlabel('Machine mean time to failure in months with an exponential distribution')
+plt.pyplot.ylabel('Time to data unavailability in years')
+plt.pyplot.savefig('outages-by-mttf-60-months.png', dpi=300)
+plt.pyplot.show()
+
+pd.DataFrame(outages_per_mttf_30_months).boxplot()
+plt.pyplot.title('Time to data unavailability by machine MTTF')
+plt.pyplot.xlabel('Machine mean time to failure in months with an exponential distribution')
+plt.pyplot.ylabel('Time to data unavailability in years')
+plt.pyplot.savefig('outages-by-mttf-30-months.png', dpi=300)
+plt.pyplot.show()
+
+
+# %%
+def sim_outages_per_num_partitions(base_cfg: SimConfig) -> Dict[int, List[float]]:
+    """See what happens if we vary the time to failure."""
+    outages_by_partition = collections.defaultdict(list)
+
+    # Create an abundant number (one that has many divisors) so there's more
+    # partitions that evenly divide the number of partitions.
+    num_machines = 60
+
+    for partition in [1, 2, 3, 4, 5, 10, 12, 15, 20, 30]:
+        cfg = dataclasses.replace(
+            base_cfg,
+            num_machines=num_machines,
+            num_partitions=partition)
+
+        result = run_sim(cfg)
+        for outages in result.full_outages:
+            # If there's a lot of variance, there might not be any full outages
+            # so default the sim duration instead.
+            first_fail = total_hours(cfg.sim_duration)
+            if outages.size > 0:
+                first_fail = outages[0, 0]
+            outages_by_partition[partition].append(first_fail / (24 * 365))
+
+    return outages_by_partition
+
+
+# %%
+outages_per_partition = sim_outages_per_num_partitions(base_cfg=BASE_CONFIG)
+
 # # %%
 # plt.interactive(False)
 # pd.DataFrame(outages_per_partition).boxplot()
