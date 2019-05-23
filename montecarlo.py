@@ -208,26 +208,51 @@ class Outage:
 
 
 def find_overlap_masks(starts: np.ndarray, ends: np.ndarray) -> np.ndarray:
-    # Shift starts left one.
-    start_shifts = np.roll(starts, -1, axis=2)
-    start_shifts[:, :, -1] = int(2 ** 62)
+    """Returns a boolean mask where the start of any overlap is True.
 
-    # An overlap is anywhere that end - shift_starts is greater than or
+    This only finds adjacent overlaps and will miss cases where a cell
+    overlaps another cell that's not adjacent like:
+
+        [[0, 10], [4, 6], [8, 11]]
+
+        # Mask
+        [True, False, False]
+
+    Even though [0, 10] overlaps everything, this function only detects the
+    first overlap.
+    """
+    # Shift starts left one.
+    starts_shift = np.roll(starts, -1, axis=2)
+    starts_shift[:, :, -1] = int(2 ** 62)
+
+    # An overlap is anywhere that end - starts_shift is greater than or
     # equal to 0.
-    return (ends - start_shifts) >= 0
+    return (ends - starts_shift) >= 0
+
+
+def machine_ids(num_iterations, num_machines, num_cols):
+    ids = np.transpose(
+        np.arange(num_machines)
+            .repeat(num_cols * num_iterations)
+            .reshape(num_machines, num_cols, num_iterations),
+        axes=(2, 0, 1))
+    return ids
 
 
 def gen_machine_outages(
+        num_iterations: int,
         num_machines: int,
         time_to_failure_dist: RandomDistFn,
         time_to_repair_dist: RandomDistFn,
-        sim_duration: datetime.timedelta,
-        num_iterations: int):
+        sim_duration: RandomDistFn) -> List[np.ndarray]:
     """Generates a list of outages for num_machines run num_iterations times.
 
-    The outages for each machine are drawn from an exponential distribution using
-    mean time to failure (mttf).  The outage duration is failure start time plus
-    the duration in hours drawn from time_to_repair_dist.
+    An outage in a 3 element ndarray of [start_time, end_time, machine_id].  The
+    length of the returned list is num_iterations.
+
+    The outages start times for each machine are drawn from the
+    time_to_failure_dist.  The outage end times is the start time plus the
+    repair times drawn from the time_to_repair_dist.
     """
     starts = gen_machine_failure_starts(
         num_iterations=num_iterations,
@@ -235,7 +260,6 @@ def gen_machine_outages(
         time_to_failure_dist=time_to_failure_dist,
         sim_duration=sim_duration,
     )
-    print('starts', starts)
     repairs = time_to_repair_dist(starts.size).reshape(starts.shape)
     ends = starts + repairs
     ends = np.clip(ends, a_min=None, a_max=total_hours(sim_duration), out=ends)
@@ -247,8 +271,8 @@ def gen_machine_outages(
     for i, j, k in overlap_start_indexes:
         cur_end = ends[i, j, k]
 
-        # Set the cur_end to largest end in any of the following, overlapping
-        # ends.
+        # Coalesce by setting the cur_end to largest end in any of the
+        # following ends that overlap cur_end.
         for k2 in range(k + 1, ends[i, j].size):
             next_start = starts[i, j, k2]
             next_end = ends[i, j, k2]
@@ -259,113 +283,37 @@ def gen_machine_outages(
             # Translate from 3d to 1d.
             coalesced_indexes.append(i * num_machines * num_cols + j * num_cols + k2)
 
-    # Clever way to get machine IDs to line up with the starts and ends.
-    ids = machine_ids(num_iterations, num_machines, num_cols, starts.shape)
+    ids = machine_ids(num_iterations, num_machines, num_cols)
     stacked = np.stack((starts, ends, ids), axis=-1)
     flattened = stacked.reshape(starts.size, stacked.shape[-1])
     # Drop outages where the start is after the sim_duration.
     rows_to_keep = flattened[:, 0] < total_hours(sim_duration)
     # Drop outages that we already coalesced so they're not double counted.
     rows_to_keep[coalesced_indexes] = False
-    pruned = flattened[rows_to_keep]
-    return pruned
+
+    # Split into a python list so the arrays can be different sizes.
+    splits = [x.reshape(num_machines * num_cols, stacked.shape[-1])
+              for x in np.split(flattened, num_iterations)]
+    split_masks = np.split(rows_to_keep, num_iterations)
+
+    # Apply the masks.
+    for i in range(num_iterations):
+        mask = split_masks[i]
+        masked = splits[i][mask]
+        splits[i] = masked
+
+    return splits
 
 
-def machine_ids(num_iterations, num_machines, num_cols, shape):
-    ids = np.transpose(
-        np.arange(num_machines)
-            .repeat(num_iterations * num_cols)
-            .reshape(shape),
-        axes=(1, 0, 2))
-    return ids
+seedSet = 1558056445
+np.random.seed(seedSet)
+gen_machine_outages(
+    num_iterations=2,
+    num_machines=2,
+    time_to_failure_dist=lambda size: normal_dist(hours(1), hours(6), size),
+    time_to_repair_dist=lambda size: exp_dist(hours(3), size),
+    sim_duration=hours(10))
 
-
-# seedSet = 1558056444
-# np.random.seed(seedSet)
-# gen_machine_outages(
-#     num_machines=2,
-#     time_to_failure_dist=lambda size: exp_dist(hours(3), size),
-#     time_to_repair_dist=lambda size: normal_dist(hours(1), hours(6), size),
-#     sim_duration=hours(10),
-#     num_iterations=2)
-
-machine_ids(2, 3, 4)
-
-# %%
-a = np.array(
-    [[[[1., 2., 0.],
-       [19., 21., 0.],
-       [21., 25., 0.]],
-      [[1., 3., 1.],
-       [10., 13., 1.],
-       [11., 13., 1.]]]])
-
-np.delete(a, [[0, 1, 1, 1, 1]], axis=2)
-# %%
-
-
-s = np.array([
-    [[0, 3, 5],
-     [0, 7, 11]]
-])
-e = np.array([
-    [[4, 4, 9],
-     [1, 10, 12]]
-])
-s1 = shift_one_3d(s, replacement=int(2 ** 62))
-(e - s1) > 0
-
-# %%
-prices = np.full(100, fill_value=np.nan)
-prices[[0, 25, 60, -1]] = [80., 30., 75., 50.]
-~np.isnan(prices)
-
-
-# %%
-def shift_one(arr, replacement=0):
-    rolled = np.roll(arr, -1, axis=1)
-    rolled[:, -1] = replacement
-    return rolled
-
-
-lo = np.array([[1, 4, 4, 9]])
-hi = np.array([[5, 7, 8, 12]])
-id = np.array([[11, 11, 11, 11]])
-np.sign(hi - shift_one(lo, replacement=int(2 ** 62)))
-
-
-# a = np.arange(24).reshape(4, 6)
-# b = np.roll(a, -1, axis=1)
-# b[:, -1] = float('inf')
-# b
-
-# %%
-def new_array(num_rows, dist, min_hours):
-    # Get the 30th percentile as a reasonable guess for how many samples we need.
-    # Use a lower percentile to increase num_cols and avoid looping in most cases.
-    p30_val = np.quantile(dist(20), 0.3)
-    # Generate at least 10 columns each time.
-    num_cols = max(int(min_hours / p30_val), 10)
-    storage = []
-
-    while True:
-        starts = dist(size=(num_rows, num_cols)).cumsum(axis=1)
-        is_larger = starts[:, -1] >= min_hours
-        good_rows = starts[is_larger, :]
-        storage.append(good_rows)
-
-        number_of_good_rows = sum([_a.shape[0] for _a in storage])
-        if number_of_good_rows >= num_rows:
-            starts = np.vstack(storage)
-            break
-
-    # Only keep columns up to the column where each value > min_hours.
-    # also use logical indexing here
-    min_col_idx = np.logical_not(np.all(starts > min_hours, axis=0))
-    return starts[:, min_col_idx]
-
-
-a = new_array(5, lambda size: np.random.normal(3, size=size), 150)
 
 # %%
 @dataclass(frozen=True, order=True)
@@ -546,12 +494,10 @@ def run_sim(cfg: SimConfig) -> List[SimResult]:
     data_count_by_clique = distribute_data(
         cfg.num_machines, cfg.num_partitions, cfg.num_replicas, cfg.num_data)
     all_sim_duration = cfg.sim_duration * cfg.num_iterations
-    all_outages = gen_machine_outages(
-        num_machines=cfg.num_machines,
-        time_to_failure_dist=cfg.time_to_failure_dist,
-        time_to_repair_dist=cfg.time_to_repair_dist,
-        sim_duration=all_sim_duration,
-    )
+    all_outages = gen_machine_outages(num_iterations=all_sim_duration, num_machines=,
+                                      time_to_failure_dist=cfg.num_machines,
+                                      time_to_repair_dist=cfg.time_to_failure_dist,
+                                      sim_duration=cfg.time_to_repair_dist)
 
     sim_hours = total_hours(cfg.sim_duration)
     sim_end_hours = range(sim_hours - 1, total_hours(all_sim_duration), sim_hours)
