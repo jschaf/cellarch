@@ -268,7 +268,7 @@ def gen_machine_outages(
     ids = machine_ids(num_iterations, num_machines, num_cols)
     stacked = np.stack((starts, ends, ids), axis=-1)
     flattened = stacked.reshape(starts.size, stacked.shape[-1])
-    # Drop outages where the start is after the sim_duration.
+    # Only keep outages where the start is before the end of the sim.
     rows_to_keep = flattened[:, 0] < total_hours(sim_duration)
     # Drop outages that we already coalesced so they're not double counted.
     rows_to_keep[coalesced_indexes] = False
@@ -357,6 +357,49 @@ find_outage_cliques_single(a[0], clique_size=2, machines_per_partition=2)
 
 
 # %%
+def find_overlap_mask(intervals: np.ndarray) -> np.ndarray:
+    starts = intervals[:, 0]
+    ends = intervals[:, 1]
+    # Shift starts left one.
+    starts_shift = np.roll(starts, -1, axis=0)
+    starts_shift[-1] = int(2 ** 62)
+
+    # An overlap is anywhere that end - starts_shift is greater than or
+    # equal to 0.
+    return (ends - starts_shift) > 0
+
+
+def find_overlaps(intervals: np.ndarray) -> np.ndarray:
+    starts = intervals[:, 0]
+    ends = intervals[:, 1]
+
+    # Sort by start and end column. Requires structured arrays.
+    # https://stackoverflow.com/questions/2828059
+    view = intervals.view(dtype=[('start', 'f8'), ('end', 'f8')])
+    view.sort(order=['start', 'end'], axis=0)
+    overlap_mask = find_overlap_mask(intervals)
+    overlap_start_indexes = np.transpose(np.nonzero(overlap_mask))[0]
+    for i in overlap_start_indexes:
+        cur_end = intervals[i][1]
+
+        # Coalesce by setting the cur_end to largest end in any of the
+        # following ends that overlap cur_end.
+        for j in range(i + 1, intervals.size):
+            next_start = intervals[j, 0]
+            next_end = intervals[j, 1]
+            if cur_end < next_start:
+                break
+            cur_end = max(cur_end, next_end)
+            ends[i, j, k] = cur_end
+            # Translate from 3d to 1d.
+            coalesced_indexes.append(i * num_machines * num_cols + j * num_cols + k2)
+
+
+arr = np.array([[0, 5], [8, 12], [5, 11], [6, 9], [6, 31], [17, 20], ])
+# np.nonzero(find_overlap_mask(arr))[0]
+view = arr.view(dtype=[('start', 'f8'), ('end', 'f8')])
+view.sort(order=['start', 'end'], axis=0)
+arr
 
 # %%
 
